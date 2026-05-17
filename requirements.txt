@@ -1,0 +1,15 @@
+streamlit>=1.32.0
+pytrends>=4.9.2
+praw>=7.7.1
+requests>=2.31.0
+yfinance>=0.2.40
+pandas>=2.1.0
+numpy>=1.26.0
+plotly>=5.18.0
+networkx>=3.2.1
+python-louvain>=0.16
+vaderSentiment>=3.3.2
+groq>=0.5.0
+scipy>=1.12.0
+pyvis>=0.3.2
+python-dateutil>=2.8.2
