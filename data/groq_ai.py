@@ -1,6 +1,8 @@
 # data/groq_ai.py — Groq AI insight generation
 
 from __future__ import annotations
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 from config import GROQ_MODEL, GROQ_TOKENS, TTL_GROQ
 
