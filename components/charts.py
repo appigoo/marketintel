@@ -1,12 +1,25 @@
 # components/charts.py — All Plotly chart builders for MarketIntel
 
 from __future__ import annotations
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from config import COLORS, KW_COLORS, CLUSTER_COLORS
+
+def _hex_to_rgba(hex_color: str, alpha: float = 0.1) -> str:
+    """Convert #rrggbb or #rgb hex to rgba(r,g,b,alpha) for Plotly compatibility."""
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c*2 for c in h)
+    if len(h) >= 6:
+        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        return f"rgba({r},{g},{b},{alpha})"
+    return hex_color  # fallback: return as-is
+
 
 _BG   = COLORS["bg"]
 _INK  = COLORS["ink"]
@@ -18,18 +31,20 @@ _BRIGHT = COLORS["bright"]
 _FONT = dict(family="DM Mono, monospace", color=_BODY)
 
 def _base_layout(**kwargs) -> dict:
-    return dict(
-        paper_bgcolor=_BG, plot_bgcolor=_BG,
+    """Build base Plotly layout dict. All keys can be overridden via kwargs."""
+    defaults = dict(
+        paper_bgcolor=_BG,
+        plot_bgcolor=_BG,
         font=_FONT,
         margin=dict(l=12, r=12, t=28, b=12),
-        legend=dict(
-            bgcolor=_INK, bordercolor=_LINE, borderwidth=1,
-            font=dict(family="DM Mono", size=9, color=_DIM),
-        ),
+        legend=dict(bgcolor=_INK, bordercolor=_LINE, borderwidth=1,
+                    font=dict(family="DM Mono", size=9, color=_DIM)),
         xaxis=dict(gridcolor=_LINE, zerolinecolor=_LINE, tickfont=_FONT),
         yaxis=dict(gridcolor=_LINE, zerolinecolor=_LINE, tickfont=_FONT),
-        **kwargs,
     )
+    # kwargs fully overrides any matching key
+    defaults.update(kwargs)
+    return defaults
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,7 +66,7 @@ def trend_chart(
             name=kw, mode="lines",
             line=dict(color=color, width=2),
             fill="tozeroy",
-            fillcolor=color.replace(")", ",0.06)").replace("rgb", "rgba") if "rgb" in color else color + "10",
+            fillcolor=_hex_to_rgba(color, 0.07),
             hovertemplate=f"<b>{kw}</b><br>熱度: %{{y:.0f}}<br>%{{x|%m/%d}}<extra></extra>",
         ), secondary_y=False)
 
@@ -80,7 +95,7 @@ def trend_chart(
         fig.update_yaxes(
             title_text=f"{ticker} ($)", secondary_y=True,
             tickfont=dict(color="#00b8ff", family="DM Mono", size=9),
-            gridcolor="transparent",
+            gridcolor="rgba(0,0,0,0)",
         )
 
     fig.update_layout(
@@ -144,16 +159,18 @@ def sentiment_donut(bull: float, bear: float, neut: float, height: int = 200) ->
     fig.update_layout(
         height=height,
         showlegend=True,
-        legend=dict(
-            orientation="v", x=1.02, y=0.5,
-            bgcolor=_BG, font=dict(family="DM Mono", size=9, color=_DIM),
-        ),
         annotations=[dict(
             text=f"<b>{bull:.0f}%</b><br><span style='font-size:9px'>看漲</span>",
             x=0.5, y=0.5, showarrow=False,
             font=dict(family="Bebas Neue", size=26, color=COLORS["bull"]),
         )],
-        **_base_layout(margin=dict(l=0, r=80, t=10, b=10)),
+        **_base_layout(
+            margin=dict(l=0, r=80, t=10, b=10),
+            legend=dict(
+                orientation="v", x=1.02, y=0.5,
+                bgcolor=_BG, font=dict(family="DM Mono", size=9, color=_DIM),
+            ),
+        ),
     )
     return fig
 
@@ -183,22 +200,20 @@ def lag_correlation_chart(lags: list[int], rs: list[float],
         textposition="outside",
         hovertemplate="時間偏移: %{x}<br>相關係數 r: %{y:.3f}<extra></extra>",
     ))
-    fig.update_layout(
+    ann = []
+    if rs:
+        best_x = (f"{'+' if best_lag > 0 else ''}{best_lag}d" if best_lag != 0 else "同步")
+        ann = [dict(x=best_x, y=max(rs)+0.05, text="★ 最佳", showarrow=False,
+                    font=dict(color=COLORS["bull"], size=9, family="DM Mono"))]
+    fig.update_layout(**_base_layout(
         height=height,
+        annotations=ann,
         yaxis=dict(range=[-1, 1.15], tickformat=".2f",
                    gridcolor=_LINE, zerolinecolor=_LINE,
                    tickfont=dict(family="DM Mono", size=8, color=_DIM)),
-        xaxis=dict(gridcolor="transparent",
+        xaxis=dict(gridcolor="rgba(0,0,0,0)",
                    tickfont=dict(family="DM Mono", size=8, color=_DIM)),
-        **_base_layout(
-            annotations=[dict(
-                x=f"{'+' if best_lag > 0 else ''}{best_lag}d" if best_lag != 0 else "同步",
-                y=max(rs) + 0.05,
-                text="★ 最佳", showarrow=False,
-                font=dict(color=COLORS["bull"], size=9, family="DM Mono"),
-            )] if rs else [],
-        ),
-    )
+    ))
     return fig
 
 
@@ -217,6 +232,12 @@ def scatter_volume_return(
         return _empty_fig(height)
 
     ret = price_df["Close"].pct_change(lead_days).shift(-lead_days)
+    # Normalise both indices to date-only to allow alignment
+    vol_idx = pd.to_datetime(volume_series.index).normalize().tz_localize(None)
+    ret_idx = pd.to_datetime(ret.index).normalize().tz_localize(None)
+    volume_series = volume_series.copy(); volume_series.index = vol_idx
+    ret = ret.copy(); ret.index = ret_idx
+
     common = volume_series.index.intersection(ret.index)
     if len(common) < 5:
         return _empty_fig(height)
@@ -276,9 +297,9 @@ def dual_axis_30d(
         fig.add_trace(go.Scatter(
             x=volume_df.index, y=volume_df[kw],
             name=f"{kw} 討論量", mode="lines",
-            line=dict(color=color + "bb", width=1.5),
+            line=dict(color=_hex_to_rgba(color, 0.73), width=1.5),
             fill="tozeroy",
-            fillcolor=color + "0d",
+            fillcolor=_hex_to_rgba(color, 0.06),
         ), secondary_y=False)
         if peaks_mask is not None and kw in peaks_mask.columns:
             pk = volume_df.index[peaks_mask[kw]]
@@ -303,7 +324,7 @@ def dual_axis_30d(
             fig.update_yaxes(
                 title_text=f"{tkr} ($)", secondary_y=True,
                 tickfont=dict(color=COLORS["ice"], family="DM Mono", size=9),
-                gridcolor="transparent",
+                gridcolor="rgba(0,0,0,0)",
             )
 
     fig.update_layout(
@@ -333,12 +354,12 @@ def pattern_bars(labels: list[str], values: list[float],
         textposition="outside",
         hovertemplate="%{x}: %{y:.0f}<extra></extra>",
     ))
-    fig.update_layout(
+    fig.update_layout(**_base_layout(
         height=height,
+        margin=dict(l=8, r=8, t=8, b=8),
         yaxis=dict(showticklabels=False, gridcolor=_LINE),
-        xaxis=dict(tickfont=dict(family="DM Mono", size=9, color=_DIM), gridcolor="transparent"),
-        **_base_layout(margin=dict(l=8, r=8, t=8, b=8)),
-    )
+        xaxis=dict(tickfont=dict(family="DM Mono", size=9, color=_DIM), gridcolor="rgba(0,0,0,0)"),
+    ))
     return fig
 
 
@@ -367,13 +388,13 @@ def zscore_bars(kw_z: dict[str, float], height: int = 160) -> go.Figure:
     fig.add_hline(y=2.0, line=dict(color=COLORS["warn"], dash="dot", width=1),
                   annotation_text="黃色警告 2.0", annotation_font_color=COLORS["warn"],
                   annotation_font_size=9)
-    fig.update_layout(
+    fig.update_layout(**_base_layout(
         height=height,
+        margin=dict(l=8, r=8, t=20, b=8),
         yaxis=dict(range=[0, max(max(z_vals) + 0.5, 4)], gridcolor=_LINE,
                    tickfont=dict(family="DM Mono", size=8, color=_DIM)),
-        xaxis=dict(tickfont=dict(family="DM Mono", size=9, color=_DIM), gridcolor="transparent"),
-        **_base_layout(margin=dict(l=8, r=8, t=20, b=8)),
-    )
+        xaxis=dict(tickfont=dict(family="DM Mono", size=9, color=_DIM), gridcolor="rgba(0,0,0,0)"),
+    ))
     return fig
 
 
