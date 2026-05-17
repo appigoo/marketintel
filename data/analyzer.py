@@ -1,6 +1,8 @@
 # data/analyzer.py — Analysis engine for MarketIntel
 
 from __future__ import annotations
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -323,9 +325,12 @@ def compute_price_correlation(
         if vol.empty or ret.empty:
             return _empty_corr()
 
-        # Reindex to common dates
+        # Normalise both indices to date-only (strip timezone / time component)
+        vol.index = pd.to_datetime(vol.index).normalize().tz_localize(None)
+        ret.index = pd.to_datetime(ret.index).normalize().tz_localize(None)
+
         common = vol.index.intersection(ret.index)
-        if len(common) < 10:
+        if len(common) < 8:
             return _empty_corr()
 
         vol = vol.loc[common]
