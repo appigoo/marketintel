@@ -1,10 +1,8 @@
-# data/fetcher.py — All data fetching for MarketIntel
-# Streamlit Cloud compatible: no Playwright, no snscrape
-# Sources: Google Trends, Stocktwits (public API), Reddit (PRAW-lite), yfinance
-
+# data/fetcher.py — Real data: Stocktwits + Reddit + yFinance + Google Trends
 from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time, requests, random
 from datetime import datetime, timedelta, timezone
 import pandas as pd
@@ -18,310 +16,205 @@ try:
 except Exception:
     PYTRENDS_OK = False
 
-from config import (
-    PYTRENDS_TIMEOUT, PYTRENDS_RETRIES, REDDIT_LIMIT,
-    STOCKTWITS_LIMIT, TTL_TRENDS, TTL_REDDIT, TTL_STOCKTWIT, TTL_YFINANCE,
-    STOCKTWITS_SUBREDDITS, STOCKTWITS_MAP, TRENDS_GEO
-)
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _vader = SentimentIntensityAnalyzer()
+    VADER_OK = True
+except Exception:
+    VADER_OK = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GOOGLE TRENDS
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=TTL_TRENDS, show_spinner=False)
-def fetch_trends(keywords: tuple[str, ...], timeframe: str = "today 1-m") -> dict:
-    """
-    Returns:
-        {
-          "interest_over_time": pd.DataFrame,   # index=date, cols=keywords
-          "interest_by_region": pd.DataFrame,   # index=region, cols=keywords
-          "related": {kw: pd.DataFrame},
-        }
-    """
-    if not PYTRENDS_OK:
-        return _empty_trends(keywords)
-
-    kws = list(keywords)[:5]   # Google Trends max 5
-    try:
-        pt = TrendReq(hl="en-US", tz=360,
-                      timeout=PYTRENDS_TIMEOUT,
-                      retries=PYTRENDS_RETRIES,
-                      backoff_factor=0.5)
-        pt.build_payload(kws, timeframe=timeframe, geo=TRENDS_GEO)
-        iot = pt.interest_over_time()
-        if "isPartial" in iot.columns:
-            iot = iot.drop(columns=["isPartial"])
-
-        try:
-            ibr = pt.interest_by_region(resolution="COUNTRY", inc_low_vol=True)
-        except Exception:
-            ibr = pd.DataFrame()
-
-        related = {}
-        for kw in kws:
-            try:
-                time.sleep(random.uniform(0.5, 1.2))
-                pt.build_payload([kw], timeframe=timeframe, geo=TRENDS_GEO)
-                rq = pt.related_queries()
-                related[kw] = rq.get(kw, {}).get("top", pd.DataFrame())
-            except Exception:
-                related[kw] = pd.DataFrame()
-
-        return {"interest_over_time": iot, "interest_by_region": ibr, "related": related}
-    except Exception as e:
-        st.warning(f"Google Trends 限流，使用模擬數據。({e})")
-        return _simulate_trends(keywords)
-
-
-def _empty_trends(keywords):
-    return {"interest_over_time": pd.DataFrame(), "interest_by_region": pd.DataFrame(), "related": {}}
-
-
-def _simulate_trends(keywords):
-    """Fallback: generate realistic-looking 30-day simulated trend data."""
-    days = 30
-    dates = pd.date_range(end=datetime.now(timezone.utc), periods=days, freq="D")
-    rng = np.random.default_rng(42)
-    data = {}
-    base = {"TSLA": 60, "TESLA": 50, "ELON MUSK": 70, "SPCX": 20}
-    for kw in keywords:
-        b = base.get(kw.upper(), 40)
-        series = np.clip(b + rng.normal(0, 10, days).cumsum() * 0.3 + rng.normal(0, 8, days), 5, 100)
-        # inject 2–3 spikes
-        for _ in range(2):
-            i = rng.integers(5, days - 2)
-            series[i:i+2] = np.clip(series[i:i+2] * rng.uniform(1.8, 3.2), 0, 100)
-        data[kw] = series.astype(int)
-    return {
-        "interest_over_time": pd.DataFrame(data, index=dates),
-        "interest_by_region": pd.DataFrame(),
-        "related": {},
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STOCKTWITS  (public, no auth required for basic symbol streams)
-# ─────────────────────────────────────────────────────────────────────────────
-_ST_HEADERS = {
+_ST_HDR = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "application/json",
+    "Referer": "https://stocktwits.com",
 }
+_RD_HDR = {"User-Agent": "MarketSignal/1.0 (academic)","Accept":"application/json"}
 
-@st.cache_data(ttl=TTL_STOCKTWIT, show_spinner=False)
-def fetch_stocktwits(symbol: str, limit: int = STOCKTWITS_LIMIT) -> dict:
-    """
-    Returns:
-        {
-          "messages": [{"body", "sentiment", "created_at", "likes"}],
-          "symbol": str,
-          "bull_pct": float,
-          "bear_pct": float,
-          "total": int,
-        }
-    """
+# ── helpers ──────────────────────────────────────────────────────
+def _resolve_sent(st_sent, body):
+    vc = _vader.polarity_scores(body)["compound"] if VADER_OK and body else 0.0
+    if st_sent == "bullish":   return "bullish", vc
+    if st_sent == "bearish":   return "bearish", vc
+    if vc >= 0.05:             return "bullish", vc
+    if vc <= -0.05:            return "bearish", vc
+    return "neutral", vc
+
+def _parse_dt(s):
+    try:    return datetime.fromisoformat(s.replace("Z","+00:00")).replace(tzinfo=None)
+    except: return datetime.utcnow()
+
+# ── STOCKTWITS ────────────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_stocktwits_stream(symbol: str, limit: int = 30) -> dict:
     url = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
-    params = {"limit": limit, "filter": "top"}
     try:
-        r = requests.get(url, params=params, headers=_ST_HEADERS, timeout=10)
+        r = requests.get(url, params={"limit": limit}, headers=_ST_HDR, timeout=12)
         if r.status_code != 200:
-            return _simulate_stocktwits(symbol)
-        data = r.json()
-        msgs = data.get("messages", [])
-        result = []
-        bull = bear = 0
+            return {"ok": False, "messages": [], "symbol": symbol, "error": f"HTTP {r.status_code}"}
+        msgs = r.json().get("messages", [])
+        parsed = []
         for m in msgs:
-            sent = None
-            if m.get("entities", {}).get("sentiment"):
-                sent = m["entities"]["sentiment"].get("basic", "").lower()
-            if sent == "bullish":
-                bull += 1
-            elif sent == "bearish":
-                bear += 1
-            result.append({
-                "body":       m.get("body", ""),
-                "sentiment":  sent,
-                "created_at": m.get("created_at", ""),
-                "likes":      m.get("likes", {}).get("total", 0),
-                "username":   m.get("user", {}).get("username", ""),
+            body = m.get("body","")
+            ent  = m.get("entities",{})
+            raw  = ent.get("sentiment",{}).get("basic","").lower() if ent.get("sentiment") else None
+            sent, vc = _resolve_sent(raw, body)
+            parsed.append({
+                "body":       body, "sentiment": sent, "created_at": _parse_dt(m.get("created_at","")),
+                "likes":      m.get("likes",{}).get("total",0),
+                "username":   m.get("user",{}).get("username",""),
+                "followers":  m.get("user",{}).get("followers",0),
+                "vader":      round(vc,3),
             })
-        total = len(result)
-        bull_pct = round(bull / total * 100, 1) if total else 50.0
-        bear_pct = round(bear / total * 100, 1) if total else 30.0
-        return {"messages": result, "symbol": symbol,
-                "bull_pct": bull_pct, "bear_pct": bear_pct, "total": total}
-    except Exception:
-        return _simulate_stocktwits(symbol)
+        return {"ok": True, "messages": parsed, "symbol": symbol, "fetched_at": datetime.utcnow()}
+    except Exception as e:
+        return {"ok": False, "messages": [], "symbol": symbol, "error": str(e)}
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_stocktwits_history(symbol: str, pages: int = 8) -> list:
+    """Paginate Stocktwits for more history (older messages)."""
+    all_msgs, max_id = [], None
+    for _ in range(pages):
+        params = {"limit": 30}
+        if max_id: params["max"] = max_id
+        try:
+            r = requests.get(f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json",
+                             params=params, headers=_ST_HDR, timeout=12)
+            if r.status_code != 200: break
+            msgs = r.json().get("messages", [])
+            if not msgs: break
+            for m in msgs:
+                body = m.get("body","")
+                ent  = m.get("entities",{})
+                raw  = ent.get("sentiment",{}).get("basic","").lower() if ent.get("sentiment") else None
+                sent, vc = _resolve_sent(raw, body)
+                all_msgs.append({
+                    "body": body, "sentiment": sent,
+                    "created_at": _parse_dt(m.get("created_at","")),
+                    "likes": m.get("likes",{}).get("total",0),
+                    "username": m.get("user",{}).get("username",""),
+                    "followers": m.get("user",{}).get("followers",0),
+                    "vader": round(vc,3),
+                })
+            max_id = msgs[-1].get("id")
+            time.sleep(random.uniform(0.2, 0.5))
+        except Exception:
+            break
+    return all_msgs
 
-def _simulate_stocktwits(symbol: str) -> dict:
-    rng = np.random.default_rng(int(time.time()) % 1000)
-    bull = int(rng.integers(45, 78))
-    bear = int(rng.integers(10, 35))
-    return {
-        "messages": [],
-        "symbol": symbol,
-        "bull_pct": float(bull),
-        "bear_pct": float(bear),
-        "total": int(rng.integers(80, 300)),
-        "_simulated": True,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REDDIT  (public JSON API — no auth needed for public subreddits)
-# ─────────────────────────────────────────────────────────────────────────────
-_REDDIT_HEADERS = {
-    "User-Agent": "MarketIntel/1.0 (academic research; contact: research@example.com)",
-    "Accept": "application/json",
-}
-
-@st.cache_data(ttl=TTL_REDDIT, show_spinner=False)
-def fetch_reddit(keyword: str, limit: int = REDDIT_LIMIT) -> dict:
-    """
-    Search Reddit for keyword across financial subreddits.
-    Returns:
-        {
-          "posts": [{"title","score","num_comments","created_utc","subreddit","url"}],
-          "total_score": int,
-          "mention_count": int,
-          "avg_score": float,
-          "top_subreddits": {subreddit: count},
-        }
-    """
-    subreddits = "+".join(STOCKTWITS_SUBREDDITS)
-    url = f"https://www.reddit.com/r/{subreddits}/search.json"
-    params = {
-        "q": keyword, "sort": "hot", "t": "month",
-        "limit": min(limit, 100), "restrict_sr": "true",
-    }
+# ── REDDIT ────────────────────────────────────────────────────────
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_reddit_posts(keyword: str, limit: int = 25) -> dict:
+    subs = "wallstreetbets+stocks+investing+options+TSLA+StockMarket"
+    params = {"q": keyword, "sort": "hot", "t": "day", "limit": limit, "restrict_sr": "true"}
     try:
-        r = requests.get(url, params=params, headers=_REDDIT_HEADERS, timeout=12)
+        r = requests.get(f"https://www.reddit.com/r/{subs}/search.json",
+                         params=params, headers=_RD_HDR, timeout=12)
         if r.status_code != 200:
-            return _simulate_reddit(keyword)
-        data = r.json()
-        children = data.get("data", {}).get("children", [])
+            return {"ok": False, "posts": [], "keyword": keyword}
         posts = []
-        sub_count: dict[str, int] = {}
-        for c in children:
-            p = c.get("data", {})
-            sub = p.get("subreddit", "")
-            sub_count[sub] = sub_count.get(sub, 0) + 1
+        for c in r.json().get("data",{}).get("children",[]):
+            p = c.get("data",{})
+            title = p.get("title","")
+            vc = _vader.polarity_scores(title)["compound"] if VADER_OK else 0.0
             posts.append({
-                "title":       p.get("title", ""),
-                "score":       p.get("score", 0),
-                "num_comments":p.get("num_comments", 0),
-                "created_utc": p.get("created_utc", 0),
-                "subreddit":   sub,
-                "url":         "https://reddit.com" + p.get("permalink", ""),
+                "title": title, "score": p.get("score",0),
+                "comments": p.get("num_comments",0),
+                "created_at": datetime.fromtimestamp(p.get("created_utc",0)),
+                "subreddit": p.get("subreddit",""),
+                "url": "https://reddit.com" + p.get("permalink",""),
+                "vader": round(vc,3),
+                "sentiment": "bullish" if vc>0.05 else "bearish" if vc<-0.05 else "neutral",
             })
-        total_score = sum(p["score"] for p in posts)
-        avg_score   = round(total_score / len(posts), 1) if posts else 0
-        return {
-            "posts":          posts,
-            "total_score":    total_score,
-            "mention_count":  len(posts),
-            "avg_score":      avg_score,
-            "top_subreddits": sub_count,
-        }
-    except Exception:
-        return _simulate_reddit(keyword)
+        return {"ok": True, "posts": posts, "keyword": keyword}
+    except Exception as e:
+        return {"ok": False, "posts": [], "keyword": keyword, "error": str(e)}
 
-
-def _simulate_reddit(keyword: str) -> dict:
-    rng = np.random.default_rng(hash(keyword) % 10000)
-    n = int(rng.integers(20, 80))
-    return {
-        "posts": [],
-        "total_score": int(rng.integers(5000, 50000)),
-        "mention_count": n,
-        "avg_score": float(rng.integers(100, 800)),
-        "top_subreddits": {"wallstreetbets": n // 3, "stocks": n // 4},
-        "_simulated": True,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# YFINANCE — price + volume history
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=TTL_YFINANCE, show_spinner=False)
-def fetch_price_history(ticker: str, period: str = "1mo") -> pd.DataFrame:
-    """Returns OHLCV DataFrame, index = date."""
+# ── YFINANCE ─────────────────────────────────────────────────────
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_price_realtime(ticker: str) -> dict:
     try:
-        df = yf.download(ticker, period=period, interval="1d",
-                         progress=False, timeout=TTL_YFINANCE)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-        df.index = pd.to_datetime(df.index)
+        info  = yf.Ticker(ticker).fast_info
+        price = float(getattr(info,"last_price",0) or getattr(info,"regularMarketPrice",0))
+        prev  = float(getattr(info,"previous_close",price) or price)
+        chg   = round((price-prev)/prev*100,2) if prev else 0.0
+        return {"ok":True,"ticker":ticker,"price":round(price,2),"change_pct":chg,"prev_close":round(prev,2)}
+    except Exception as e:
+        return {"ok":False,"ticker":ticker,"price":0.0,"change_pct":0.0,"error":str(e)}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday(ticker: str, period: str = "5d", interval: str = "15m") -> pd.DataFrame:
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, timeout=15)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+        df.index = pd.to_datetime(df.index).tz_localize(None) if df.index.tz else pd.to_datetime(df.index)
+        return df.dropna()
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_daily_history(ticker: str, period: str = "1mo") -> pd.DataFrame:
+    try:
+        df = yf.download(ticker, period=period, interval="1d", progress=False, timeout=15)
+        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.droplevel(1)
+        df.index = pd.to_datetime(df.index).normalize().tz_localize(None)
+        return df.dropna()
+    except Exception:
+        return pd.DataFrame()
+
+# ── GOOGLE TRENDS ─────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_trends_7d(keywords: tuple) -> pd.DataFrame:
+    if not PYTRENDS_OK: return pd.DataFrame()
+    try:
+        pt = TrendReq(hl="en-US", tz=360, timeout=(10,25), retries=2, backoff_factor=0.5)
+        pt.build_payload(list(keywords)[:5], timeframe="now 7-d", geo="")
+        df = pt.interest_over_time()
+        if "isPartial" in df.columns: df = df.drop(columns=["isPartial"])
         return df
     except Exception:
-        return _simulate_price(ticker)
+        return pd.DataFrame()
 
+# ── HOURLY SENTIMENT TIMESERIES ───────────────────────────────────
+def build_hourly_sentiment(messages: list, hours_back: int = 48) -> pd.DataFrame:
+    """Aggregate Stocktwits messages into hourly bull/bear timeseries."""
+    if not messages: return pd.DataFrame()
+    now     = datetime.utcnow()
+    cutoff  = now - timedelta(hours=hours_back)
+    rows    = []
+    for m in messages:
+        dt = m["created_at"]
+        if hasattr(dt,"tzinfo") and dt.tzinfo: dt = dt.replace(tzinfo=None)
+        if dt < cutoff: continue
+        rows.append({"hour": dt.replace(minute=0,second=0,microsecond=0),
+                     "sentiment": m["sentiment"], "likes": m.get("likes",0)})
+    if not rows: return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    result = []
+    for hour, grp in df.groupby("hour"):
+        total = len(grp)
+        bull  = (grp["sentiment"]=="bullish").sum()
+        bear  = (grp["sentiment"]=="bearish").sum()
+        result.append({
+            "hour": hour, "bull_count": int(bull), "bear_count": int(bear),
+            "total": int(total),
+            "bull_pct": round(bull/total*100,1) if total else 50.0,
+            "bear_pct": round(bear/total*100,1) if total else 25.0,
+        })
+    return pd.DataFrame(result).set_index("hour").sort_index()
 
-@st.cache_data(ttl=TTL_YFINANCE, show_spinner=False)
-def fetch_current_price(ticker: str) -> dict:
-    """Returns {price, change_pct, volume} for display."""
-    try:
-        info = yf.Ticker(ticker).fast_info
-        price = getattr(info, "last_price", None) or getattr(info, "regularMarketPrice", 0)
-        prev  = getattr(info, "previous_close", price)
-        chg   = round((price - prev) / prev * 100, 2) if prev else 0
-        vol   = getattr(info, "three_month_average_volume", 0)
-        return {"price": round(price, 2), "change_pct": chg, "volume": vol}
-    except Exception:
-        return {"price": 0.0, "change_pct": 0.0, "volume": 0}
-
-
-def _simulate_price(ticker: str) -> pd.DataFrame:
-    rng  = np.random.default_rng(42)
-    days = 30
-    dates = pd.date_range(end=datetime.now(timezone.utc), periods=days, freq="D")
-    start = {"TSLA": 220, "SPCX": 11}.get(ticker.upper(), 100)
-    prices = np.cumprod(1 + rng.normal(0, 0.015, days)) * start
-    return pd.DataFrame({
-        "Open":   prices * rng.uniform(0.99, 1.00, days),
-        "High":   prices * rng.uniform(1.00, 1.02, days),
-        "Low":    prices * rng.uniform(0.98, 1.00, days),
-        "Close":  prices,
-        "Volume": rng.integers(20_000_000, 80_000_000, days).astype(float),
-    }, index=dates)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AGGREGATED MENTION VOLUME (combine Trends + Reddit + Stocktwits)
-# ─────────────────────────────────────────────────────────────────────────────
-def build_daily_volume(
-    keywords: list[str],
-    trends_data: dict,
-    reddit_data: dict,      # {keyword: reddit_result}
-    stocktwits_data: dict,  # {keyword: stocktwits_result}
-) -> pd.DataFrame:
-    """
-    Combine all sources into a single normalised daily mention-volume DataFrame.
-    index = date, columns = keywords, values = 0–100 normalised score.
-    """
-    iot: pd.DataFrame = trends_data.get("interest_over_time", pd.DataFrame())
-
-    if iot.empty:
-        days = 30
-        dates = pd.date_range(end=datetime.now(timezone.utc), periods=days, freq="D")
-        rng = np.random.default_rng(42)
-        result = {}
-        base = {"TSLA": 60, "TESLA": 50, "ELON MUSK": 75, "SPCX": 20}
-        for kw in keywords:
-            b = base.get(kw.upper(), 40)
-            s = np.clip(b + rng.normal(0, 8, days) + rng.normal(0, 5, days).cumsum() * 0.2, 5, 100)
-            result[kw] = s.astype(int)
-        return pd.DataFrame(result, index=dates)
-
-    # Keep only keyword columns that exist
-    cols = [kw for kw in keywords if kw in iot.columns]
-    df = iot[cols].copy() if cols else iot.copy()
-
-    # Boost with Reddit signal (adds a small daily uniform boost on high-mention days)
-    for kw in keywords:
-        if kw in df.columns:
-            rdata = reddit_data.get(kw, {})
-            boost = min(rdata.get("mention_count", 0) / 10, 10)
-            df[kw] = np.clip(df[kw] + boost, 0, 100)
-
-    return df.fillna(0)
+def compute_sentiment_momentum(hourly_df: pd.DataFrame) -> dict:
+    """Latest hour bull% vs rolling average — core signal input."""
+    if hourly_df.empty or len(hourly_df) < 2:
+        return {"momentum":0.0,"current_bull":50.0,"avg_bull":50.0,
+                "direction":"neutral","msg_velocity":0,"current_vol":0,"avg_vol":0}
+    current_bull = float(hourly_df["bull_pct"].iloc[-1])
+    avg_bull     = float(hourly_df["bull_pct"].mean())
+    momentum     = current_bull - avg_bull
+    current_vol  = int(hourly_df["total"].iloc[-1])
+    avg_vol      = float(hourly_df["total"].mean()) or 1
+    velocity_pct = round((current_vol - avg_vol) / avg_vol * 100)
+    direction    = "bullish" if momentum>5 else "bearish" if momentum<-5 else "neutral"
+    return {"momentum":round(momentum,1),"current_bull":current_bull,
+            "avg_bull":round(avg_bull,1),"direction":direction,
+            "msg_velocity":velocity_pct,"current_vol":current_vol,"avg_vol":round(avg_vol,1)}
