@@ -3,6 +3,8 @@
 # Sources: Google Trends, Stocktwits (public API), Reddit (PRAW-lite), yfinance
 
 from __future__ import annotations
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import time, requests, random
 from datetime import datetime, timedelta, timezone
 import pandas as pd
