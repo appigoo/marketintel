@@ -1,10 +1,9 @@
-# data/groq_ai.py — Groq AI insight generation
-
+# data/groq_ai.py — Groq AI signal narrative generator
 from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import json, re
 import streamlit as st
-from config import GROQ_MODEL, GROQ_TOKENS, TTL_GROQ
 
 try:
     from groq import Groq
@@ -12,172 +11,103 @@ try:
 except Exception:
     GROQ_OK = False
 
+GROQ_MODEL  = "llama-3.3-70b-versatile"
+GROQ_TOKENS = 500
 
-def _get_client():
-    api_key = st.secrets.get("GROQ_API_KEY", "")
-    if not api_key or not GROQ_OK:
-        return None
-    return Groq(api_key=api_key)
+def _client():
+    key = st.secrets.get("GROQ_API_KEY","")
+    return Groq(api_key=key) if key and GROQ_OK else None
 
-
-@st.cache_data(ttl=TTL_GROQ, show_spinner=False)
-def generate_insight(
-    keywords:   tuple[str, ...],
-    sentiments: dict,      # {kw: {bull_pct, bear_pct, compound}}
-    z_scores:   dict,      # {kw: float}
-    corr_data:  dict,      # {kw: {best_r, best_lag}}
-    ai_score:   int,
-    lang:       str = "zh-TW",
+@st.cache_data(ttl=1200, show_spinner=False)
+def generate_signal_narrative(
+    ticker:    str,
+    composite: dict,
+    sig_mom:   dict,
+    sig_vol:   dict,
+    sig_div:   dict,
+    backtest:  dict,
+    top_msgs:  tuple,   # tuple of (body, sentiment) for top 5 messages
 ) -> dict:
-    """
-    Returns {
-        "headline": str,
-        "sub": str,
-        "summary": str,
-        "actions": [{"icon", "text"}],
-        "signals": [{"icon", "text", "cls"}],
-    }
-    """
-    client = _get_client()
-    if client is None:
-        return _fallback_insight(keywords, sentiments, z_scores, corr_data, ai_score)
+    """Generate AI narrative for the composite signal."""
+    client = _client()
+    if not client:
+        return _rule_narrative(ticker, composite, sig_mom, sig_vol, sig_div, backtest)
 
-    context = _build_context(keywords, sentiments, z_scores, corr_data, ai_score)
-    prompt  = _build_prompt(context, lang)
+    signal   = composite.get("signal","HOLD")
+    price    = composite.get("price",0)
+    entry    = composite.get("entry")
+    stop     = composite.get("stop")
+    target   = composite.get("target")
+    conf     = composite.get("confidence",50)
+    win_rate = backtest.get("win_rate")
+    bull_pct = sig_mom.get("current_bull",50)
+    delta    = sig_mom.get("delta_24h",0)
+    z        = sig_vol.get("z_score",0)
+    msgs_txt = "\n".join([f"- [{s}] {b[:80]}" for b,s in top_msgs[:5]])
+
+    prompt = f"""你是一個香港散戶用的股票信號分析師。用繁體中文，簡潔直接。
+
+股票：{ticker}  現價：${price}  信號：{signal}  置信度：{conf}%
+Bull情緒：{bull_pct}%（vs 24h均值變化：{delta:+.0f}pp）
+訊息量異常：z={z:.1f}
+{'入場：$'+str(entry)+'  止損：$'+str(stop)+'  目標：$'+str(target) if entry else ''}
+{'30天勝率：'+str(win_rate)+'%' if win_rate else ''}
+
+最新市場討論樣本：
+{msgs_txt}
+
+請輸出JSON（不加markdown）：
+{{
+  "one_liner": "一句話信號結論（20字內）",
+  "why": "為什麼出現這個信號（2句，含具體數字）",
+  "risk": "主要風險（1句）",
+  "watch": "需要監察的指標（1句）"
+}}"""
 
     try:
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=GROQ_TOKENS,
-            temperature=0.3,
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=GROQ_TOKENS, temperature=0.2,
         )
         raw = resp.choices[0].message.content.strip()
-        return _parse_response(raw, keywords, sentiments, z_scores, ai_score)
-    except Exception as e:
-        st.warning(f"Groq AI 暫時不可用，使用自動分析。({e})")
-        return _fallback_insight(keywords, sentiments, z_scores, corr_data, ai_score)
-
-
-# ── PROMPT BUILDER ──────────────────────────────────────────────────────────
-def _build_context(keywords, sentiments, z_scores, corr_data, ai_score) -> str:
-    lines = [f"AI分析評分: {ai_score}/100\n"]
-    for kw in keywords:
-        s = sentiments.get(kw, {})
-        z = z_scores.get(kw, 0)
-        c = corr_data.get(kw, {})
-        lines.append(
-            f"[{kw}] 看漲={s.get('bull_pct',50):.0f}% 看跌={s.get('bear_pct',25):.0f}% "
-            f"z-score={z:.1f} 最佳相關r={c.get('best_r',0):.2f} 領先={c.get('best_lag',0)}天"
-        )
-    return "\n".join(lines)
-
-
-def _build_prompt(context: str, lang: str) -> str:
-    return f"""你是一個金融社媒輿情分析師，請根據以下數據生成分析報告（繁體中文）。
-
-數據：
-{context}
-
-請按以下JSON格式輸出（不要加```json標記）：
-{{
-  "headline": "一句話核心結論（15字內，用於大標題）",
-  "sub": "2-3句補充說明（含具體數字和原因）",
-  "summary": "3-4句AI洞察（分析關聯性、風險、建議關注點）",
-  "actions": [
-    {{"icon": "🎯", "text": "操作建議一"}},
-    {{"icon": "⚠️", "text": "風險提示"}},
-    {{"icon": "👁", "text": "監察重點"}}
-  ],
-  "signals": [
-    {{"icon": "🚀", "text": "信號描述", "cls": "sg-bull"}},
-    {{"icon": "⚡", "text": "信號描述", "cls": "sg-warn"}}
-  ]
-}}
-
-cls 只能用：sg-bull（看漲）、sg-bear（看跌）、sg-warn（警告）、sg-ice（中性/資訊）、sg-lav（特殊）"""
-
-
-def _parse_response(raw: str, keywords, sentiments, z_scores, ai_score) -> dict:
-    import json, re
-    try:
-        # Strip any markdown fences
-        cleaned = re.sub(r"```[a-z]*", "", raw).strip()
+        cleaned = re.sub(r"```[a-z]*","",raw).strip()
         data = json.loads(cleaned)
-        # Validate required keys
-        for key in ["headline", "sub", "summary", "actions", "signals"]:
-            if key not in data:
-                raise ValueError(f"Missing key: {key}")
+        for k in ["one_liner","why","risk","watch"]:
+            if k not in data: raise ValueError(f"Missing {k}")
         return data
     except Exception:
-        return _fallback_insight(keywords, sentiments, z_scores, {}, ai_score)
+        return _rule_narrative(ticker, composite, sig_mom, sig_vol, sig_div, backtest)
 
+def _rule_narrative(ticker, composite, sig_mom, sig_vol, sig_div, backtest) -> dict:
+    signal   = composite.get("signal","HOLD")
+    bull_pct = sig_mom.get("current_bull",50)
+    delta    = sig_mom.get("delta_24h",0)
+    z        = sig_vol.get("z_score",0)
+    win_rate = backtest.get("win_rate")
+    price    = composite.get("price",0)
+    entry    = composite.get("entry")
+    stop     = composite.get("stop")
+    target   = composite.get("target")
 
-# ── FALLBACK (rule-based, no AI needed) ─────────────────────────────────────
-def _fallback_insight(keywords, sentiments, z_scores, corr_data, ai_score) -> dict:
-    # Find highest z-score keyword
-    top_kw  = max(z_scores, key=z_scores.get) if z_scores else (keywords[0] if keywords else "TSLA")
-    top_z   = z_scores.get(top_kw, 0)
-    top_s   = sentiments.get(top_kw, {})
-    bull    = top_s.get("bull_pct", 55)
-    bear    = top_s.get("bear_pct", 25)
-
-    # Headline
-    if top_z >= 3.5:
-        headline = f"{top_kw} 討論量異常爆發"
-    elif bull > 65:
-        headline = f"市場情緒偏向看漲"
-    elif bear > 50:
-        headline = f"市場情緒轉向看跌"
+    if signal == "BUY":
+        one_liner = f"{ticker} 社媒情緒看漲，短線買入信號"
+        why = f"Stocktwits Bull% 升至 {bull_pct:.0f}%，較 24h 均值高 {delta:+.0f}pp；訊息量異常指數 z={z:.1f}。"
+        risk = f"若 Bull% 回落至 {max(bull_pct-12,45):.0f}% 以下，信號失效，需止損。"
+    elif signal == "SELL":
+        one_liner = f"{ticker} 情緒轉空，考慮減倉或做空"
+        why = f"Stocktwits Bull% 跌至 {bull_pct:.0f}%，較 24h 均值低 {abs(delta):.0f}pp；市場情緒明顯轉弱。"
+        risk = "社媒情緒反轉快，若 Bull% 重回升軌需及時止損。"
+    elif signal == "WATCH":
+        one_liner = f"{ticker} 訊息量異常，等待方向確認"
+        why = f"訊息量 z-score={z:.1f}，遠高於正常水平，但 Bull%={bull_pct:.0f}% 方向未明確。"
+        risk = "異常訊息量可能是噪音或大事件前兆，方向未確認前勿重倉。"
     else:
-        headline = f"市場觀望，注意力分散"
+        one_liner = f"{ticker} 無明顯信號，繼續觀望"
+        why = f"Bull%={bull_pct:.0f}%，訊息量 z={z:.1f}，均在正常範圍，無明顯買賣機會。"
+        risk = "市場平靜期等待突破，設置警報於關鍵價位。"
 
-    # Sub
-    sub_parts = []
-    for kw in keywords[:3]:
-        z = z_scores.get(kw, 0)
-        s = sentiments.get(kw, {})
-        b = s.get("bull_pct", 50)
-        if z > 2:
-            sub_parts.append(f"<strong>{kw}</strong> 討論量急升（z={z:.1f}），情緒 {b:.0f}% 看漲")
-        else:
-            sub_parts.append(f"<strong>{kw}</strong> 情緒 {b:.0f}% 看漲，熱度平穩")
-    sub = "。".join(sub_parts) + "。"
+    wr_txt = f"30天相似情況勝率 {win_rate}%" if win_rate else "歷史數據不足"
+    watch  = f"監察 Bull% 是否維持 >{max(bull_pct-5,50):.0f}%，訊息量是否持續，以及 {ticker} 能否守住 ${stop or price:.2f}。"
 
-    # Summary
-    best_kw = keywords[0] if keywords else "TSLA"
-    best_r  = corr_data.get(best_kw, {}).get("best_r", 0)
-    summary = (
-        f"根據多源數據分析，<strong>{top_kw}</strong> 是當前最活躍話題。"
-        f"{'社媒討論量與股價相關性顯著（r=' + str(round(best_r,2)) + '），具備預測價值。' if abs(best_r) > 0.4 else '社媒信號與股價相關性尚待觀察。'}"
-        f"建議重點監測 z-score 超過 3 的異常爆發事件，並結合股價走勢確認信號有效性。"
-    )
-
-    # Signals
-    signals = []
-    for kw in keywords:
-        z = z_scores.get(kw, 0)
-        s = sentiments.get(kw, {})
-        b = s.get("bull_pct", 50)
-        if z >= 3.5:
-            signals.append({"icon": "⚡", "text": f"{kw} 異常爆發 z={z:.1f}", "cls": "sg-warn"})
-        elif b > 65:
-            signals.append({"icon": "🚀", "text": f"{kw} 看漲情緒 {b:.0f}%", "cls": "sg-bull"})
-        elif b < 40:
-            signals.append({"icon": "🔻", "text": f"{kw} 情緒偏弱", "cls": "sg-bear"})
-        else:
-            signals.append({"icon": "🔵", "text": f"{kw} 情緒中性", "cls": "sg-ice"})
-
-    actions = [
-        {"icon": "🎯", "text": f"重點監測 <strong>{top_kw}</strong> 相關新聞持續性"},
-        {"icon": "⚠️", "text": "z-score 超過 3.5 時設價格警報"},
-        {"icon": "👁",  "text": "結合 yFinance 股價確認社媒信號"},
-    ]
-
-    return {
-        "headline": headline,
-        "sub":      sub,
-        "summary":  summary,
-        "actions":  actions,
-        "signals":  signals,
-    }
+    return {"one_liner": one_liner, "why": why + f"（{wr_txt}）", "risk": risk, "watch": watch}
