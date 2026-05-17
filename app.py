@@ -3,6 +3,14 @@
 # Sources: Google Trends + Stocktwits + Reddit + yFinance + Groq AI
 
 from __future__ import annotations
+import sys, os
+
+# ── FIX IMPORT PATHS (Streamlit Cloud doesn't add app dir to sys.path) ────────
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+# ─────────────────────────────────────────────────────────────────────────────
+
 import time
 from datetime import datetime, timezone
 import streamlit as st
@@ -45,9 +53,12 @@ from components.charts import (
 # ─────────────────────────────────────────────────────────────────────────────
 inject_css()
 
-hkt = datetime.now(timezone.utc).astimezone(
-    __import__("zoneinfo", fromlist=["ZoneInfo"]).ZoneInfo("Asia/Hong_Kong")
-)
+try:
+    from zoneinfo import ZoneInfo
+    hkt = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Hong_Kong"))
+except Exception:
+    from datetime import timedelta
+    hkt = datetime.now(timezone.utc) + timedelta(hours=8)
 time_str = hkt.strftime("%H:%M:%S")
 st.markdown(topbar_html(time_str), unsafe_allow_html=True)
 
